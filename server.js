@@ -4,8 +4,9 @@ import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { initDB, getDB } from './db.js';
 import cors from 'cors';
-import { OAuth2Client } from 'google-auth-library';
 import nodemailer from 'nodemailer';
+import fs from 'fs';
+import admin from 'firebase-admin';
 
 // Load environment variables
 dotenv.config();
@@ -14,25 +15,26 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true';
 
 // In production, use Redis instead of in-memory Set
 const activeTokens = new Set();
-let googleClient = null;
 
-// Initialize Google Auth if configured
-if (GOOGLE_CLIENT_ID) {
-  try {
-    googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-    console.log('Google Sign-In initialized successfully');
-  } catch (err) {
-    console.warn('Google Auth initialization failed:', err);
-    console.warn('Google Sign-In will be disabled.');
-  }
-} else {
-  console.warn('GOOGLE_CLIENT_ID not configured. Google Sign-In disabled.');
+// Firebase Admin SDK Initialization
+let firebaseCredentials;
+try {
+  firebaseCredentials = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+} catch (error) {
+  console.error("Error parsing FIREBASE_CREDENTIALS:", error);
+  process.exit(1);
 }
+
+// Initialize Firebase Admin SDK
+admin.initializeApp({
+  credential: admin.credential.cert(firebaseCredentials)
+});
+
+const firebaseInitialized = true;
 
 // Middleware
 app.use(cors({
@@ -58,7 +60,7 @@ app.get('/', (req, res) => {
     message: 'JLearn API with persistent sessions',
     timestamp: getISTTimestamp(),
     features: {
-      googleSignIn: !!googleClient,
+      googleSignIn: firebaseInitialized,
       persistentSessions: true,
       requireEmailVerification: REQUIRE_EMAIL_VERIFICATION,
       emailService: !!process.env.EMAIL_USER && !!process.env.EMAIL_PASS
@@ -80,9 +82,9 @@ app.get('/', (req, res) => {
 // Enhanced Authentication Middleware
 const authenticateJWT = (req, res, next) => {
   const authHeader = req.headers.authorization || req.query.token;
-  
+
   if (!authHeader) {
-    return res.status(401).json({ 
+    return res.status(401).json({
       error: 'Authorization header missing',
       timestamp: getISTTimestamp()
     });
@@ -92,7 +94,7 @@ const authenticateJWT = (req, res, next) => {
 
   // Check if token was invalidated
   if (!activeTokens.has(token)) {
-    return res.status(403).json({ 
+    return res.status(403).json({
       error: 'Session terminated. Please login again.',
       timestamp: getISTTimestamp()
     });
@@ -101,7 +103,7 @@ const authenticateJWT = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
       console.error('JWT verification error at', getISTTimestamp(), ':', err);
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Invalid or malformed token',
         timestamp: getISTTimestamp()
       });
@@ -123,10 +125,10 @@ export const transporter = nodemailer.createTransport({
 export const sendOTP = async (to, otp, purpose = 'email verification') => {
   try {
     const subject = purpose === 'password reset' ? 'Reset Your JLearn Password' : 'Verify Your Email with Jairisys';
-    const html = purpose === 'password reset' 
+    const html = purpose === 'password reset'
       ? `<p>Your password reset OTP is: <strong>${otp}</strong></p><p>It will expire in 10 minutes.</p>`
       : `<p>Your OTP code is: <strong>${otp}</strong></p><p>It will expire in 10 minutes.</p>`;
-    
+
     const info = await transporter.sendMail({
       from: `"JLearn" <${process.env.EMAIL_USER}>`,
       to,
@@ -142,9 +144,9 @@ export const sendOTP = async (to, otp, purpose = 'email verification') => {
   }
 };
 
-// Google Sign-In Endpoint
+// Google Sign-In (Firebase Auth) Endpoint
 app.post('/auth/google', async (req, res) => {
-  if (!googleClient) {
+  if (!firebaseInitialized) {
     return res.status(501).json({
       success: false,
       error: 'Google Sign-In is not configured on this server',
@@ -152,24 +154,19 @@ app.post('/auth/google', async (req, res) => {
     });
   }
 
-  const { token: googleToken } = req.body;
+  const { token: firebaseToken } = req.body;
 
-  if (!googleToken) {
-    return res.status(400).json({ 
-      error: 'Google token is required',
+  if (!firebaseToken) {
+    return res.status(400).json({
+      error: 'Firebase ID token is required',
       timestamp: getISTTimestamp()
     });
   }
 
   try {
-    // Verify Google token
-    const ticket = await googleClient.verifyIdToken({
-      idToken: googleToken,
-      audience: GOOGLE_CLIENT_ID,
-    });
-
-    const payload = ticket.getPayload();
-    const { email, name: username } = payload;
+    // Verify Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(firebaseToken);
+    const { uid, email } = decodedToken;
 
     const db = getDB();
 
@@ -187,6 +184,7 @@ app.post('/auth/google', async (req, res) => {
     }
 
     const userId = user.rows[0].user_id;
+    const username = user.rows[0].username;
 
     // Update last login
     await db.execute({
@@ -195,19 +193,19 @@ app.post('/auth/google', async (req, res) => {
     });
 
     // Generate JWT
-    const token = jwt.sign(
+    const appToken = jwt.sign(
       { id: userId, email, username },
       JWT_SECRET
     );
 
-    activeTokens.add(token);
+    activeTokens.add(appToken);
 
     res.json({
       success: true,
-      token,
-      user: { 
-        id: userId, 
-        username, 
+      token: appToken,
+      user: {
+        id: userId,
+        username,
         email,
         isGoogleAuth: true
       },
@@ -215,9 +213,9 @@ app.post('/auth/google', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Google auth error at', getISTTimestamp(), ':', err);
-    res.status(401).json({ 
-      error: 'Invalid Google token',
+    console.error('Firebase auth error at', getISTTimestamp(), ':', err);
+    res.status(401).json({
+      error: 'Invalid Firebase ID token',
       timestamp: getISTTimestamp()
     });
   }
@@ -229,7 +227,7 @@ app.post('/login', async (req, res) => {
   const loginTime = getISTTimestamp();
 
   if (!email || !password) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'Email and password are required',
       timestamp: loginTime
     });
@@ -244,7 +242,7 @@ app.post('/login', async (req, res) => {
 
     const user = result.rows[0];
     if (!user) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Invalid credentials',
         timestamp: loginTime
       });
@@ -252,7 +250,7 @@ app.post('/login', async (req, res) => {
 
     // Check if user registered via Google
     if (user.is_google_auth) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'This account uses Google Sign-In. Please sign in with Google.',
         timestamp: loginTime
       });
@@ -268,7 +266,7 @@ app.post('/login', async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Invalid credentials',
         timestamp: loginTime
       });
@@ -286,9 +284,9 @@ app.post('/login', async (req, res) => {
     );
 
     activeTokens.add(token);
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       token,
       user: {
         id: user.user_id,
@@ -301,7 +299,7 @@ app.post('/login', async (req, res) => {
     });
   } catch (err) {
     console.error('Login error at', getISTTimestamp(), ':', err);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Login failed',
       timestamp: getISTTimestamp()
     });
@@ -418,10 +416,6 @@ app.post('/verify-otp', async (req, res) => {
     res.status(500).json({ error: 'OTP verification failed: ' + err.message, timestamp: verifyTime });
   }
 });
-
-
-
-
 
 // Forgot Password Endpoint
 app.post('/forgot-password', async (req, res) => {
@@ -623,11 +617,11 @@ app.post('/resend-otp', async (req, res) => {
 app.post('/logout', authenticateJWT, (req, res) => {
   const token = req.headers.authorization.slice(7);
   const logoutTime = getISTTimestamp();
-  
+
   // Remove token from active set
   activeTokens.delete(token);
-  
-  res.json({ 
+
+  res.json({
     success: true,
     message: 'Logged out successfully. Token invalidated.',
     timestamp: logoutTime
@@ -640,7 +634,7 @@ app.post('/invalidate-all', async (req, res) => {
   const invalidationTime = getISTTimestamp();
 
   if (!email || !password) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'Email and password are required',
       timestamp: invalidationTime
     });
@@ -655,7 +649,7 @@ app.post('/invalidate-all', async (req, res) => {
 
     const user = result.rows[0];
     if (!user) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         error: 'User not found',
         timestamp: invalidationTime
       });
@@ -669,7 +663,7 @@ app.post('/invalidate-all', async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, pwResult.rows[0].password_hash);
     if (!isMatch) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Invalid credentials',
         timestamp: invalidationTime
       });
@@ -678,14 +672,14 @@ app.post('/invalidate-all', async (req, res) => {
     // In production: Query all tokens for this user from Redis/db and remove
     activeTokens.clear();
 
-    res.json({ 
+    res.json({
       success: true,
       message: 'All sessions invalidated successfully',
       timestamp: invalidationTime
     });
   } catch (err) {
     console.error('Invalidation error at', getISTTimestamp(), ':', err);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Session invalidation failed',
       timestamp: getISTTimestamp()
     });
@@ -698,7 +692,7 @@ app.post('/progress', authenticateJWT, async (req, res) => {
   const updateTime = getISTTimestamp();
 
   if (!language || level === undefined || module_id === undefined || lesson_id === undefined) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'Missing required fields',
       timestamp: updateTime
     });
@@ -741,14 +735,14 @@ app.post('/progress', authenticateJWT, async (req, res) => {
       ],
     });
 
-    res.json({ 
+    res.json({
       success: true,
       message: 'Progress updated successfully',
       timestamp: updateTime
     });
   } catch (err) {
     console.error('Progress update error at', getISTTimestamp(), ':', err);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to update progress',
       timestamp: getISTTimestamp()
     });
@@ -828,7 +822,7 @@ app.listen(PORT, () => {
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log('Features enabled:');
   console.log('- Persistent JWT sessions');
-  console.log('- Google Sign-In:', googleClient ? 'Enabled' : 'Disabled');
+  console.log('- Google Sign-In:', firebaseInitialized ? 'Enabled' : 'Disabled');
   console.log('- Indian Standard Time (IST) timestamps');
   console.log('- Bitmask progress tracking');
   console.log('- Email verification required:', REQUIRE_EMAIL_VERIFICATION);
